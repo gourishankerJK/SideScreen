@@ -11,6 +11,7 @@ private enum WireMessage {
     static let keyframeRequest: UInt8 = 7
     static let clientSupportsFrameMetadata: UInt8 = 8
     static let stylusEvent: UInt8 = 9
+    static let audioFrame: UInt8 = 10
 }
 
 private extension NWEndpoint {
@@ -473,6 +474,21 @@ class StreamingServer {
             // Track frame age at send time for pipeline profiling
             let sendAge = DispatchTime.now().uptimeNanoseconds - timestamp
             self.updateStats(bytes: data.count, frameAgeNs: sendAge)
+        }
+    }
+
+    func sendAudio(_ data: Data) {
+        guard let connection = connection, !isStopped, connectionReady else { return }
+
+        frameQueue.async { [weak self] in
+            guard let self = self else { return }
+            var packet = Data(capacity: data.count + 5)
+            packet.append(WireMessage.audioFrame)
+            var size = Int32(data.count).bigEndian
+            withUnsafeBytes(of: &size) { packet.append(contentsOf: $0) }
+            packet.append(data)
+
+            connection.send(content: packet, completion: .contentProcessed { _ in })
         }
     }
 

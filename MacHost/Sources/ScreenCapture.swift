@@ -26,6 +26,8 @@ class ScreenCapture {
     private var streamOutput: StreamOutput?
     private var streamDelegate: StreamDelegate?
     private var encoder: VideoEncoder?
+    private var audioStreamer: AudioStreamer?
+    var audioEnabled: Bool = false
     private var display: SCDisplay?
     private var virtualDisplayID: CGDirectDisplayID?
     private var refreshRate: Int = 60
@@ -238,12 +240,18 @@ class ScreenCapture {
         config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         config.showsCursor = true
         config.queueDepth = 4
-        config.capturesAudio = false
+        config.capturesAudio = audioEnabled
+        if audioEnabled {
+            config.excludesCurrentProcessAudio = true
+        }
         config.backgroundColor = .clear
         config.scalesToFit = false
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: delegate)
         try scStream.addStreamOutput(streamOutput!, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
+        if audioEnabled {
+            try scStream.addStreamOutput(streamOutput!, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
+        }
 
         stream = scStream
         debugLog("Stream configured: \(width)x\(height) @ \(fps)fps (with delegate)")
@@ -297,6 +305,18 @@ class ScreenCapture {
                     OSAtomicDecrement32(&self.pendingEncodes)
                 }
             }
+        }
+
+        if audioEnabled {
+            audioStreamer = AudioStreamer { [weak self] data in
+                self?.currentServer?.sendAudio(data)
+            }
+            streamOutput?.onAudioReceived = { [weak self] sampleBuffer in
+                self?.audioStreamer?.processAudioSampleBuffer(sampleBuffer)
+            }
+        } else {
+            audioStreamer = nil
+            streamOutput?.onAudioReceived = nil
         }
     }
 
@@ -446,6 +466,10 @@ class ScreenCapture {
         }
     }
 
+    func restartStreamExternal() {
+        restartStream()
+    }
+
     // MARK: - CGDisplayStream fallback
 
     private func attemptFallbackCapture() {
@@ -569,9 +593,13 @@ class ScreenCapture {
 
 class StreamOutput: NSObject, SCStreamOutput {
     var onFrameReceived: ((CMSampleBuffer) -> Void)?
+    var onAudioReceived: ((CMSampleBuffer) -> Void)?
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen else { return }
-        onFrameReceived?(sampleBuffer)
+        if type == .screen {
+            onFrameReceived?(sampleBuffer)
+        } else if type == .audio {
+            onAudioReceived?(sampleBuffer)
+        }
     }
 }

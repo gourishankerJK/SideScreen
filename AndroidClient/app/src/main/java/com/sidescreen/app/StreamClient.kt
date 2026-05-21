@@ -34,6 +34,7 @@ class StreamClient(
     var onConnectionStatus: ((Boolean) -> Unit)? = null
     var onDisplaySize: ((Int, Int, Int) -> Unit)? = null // width, height, rotation
     var onStats: ((Double, Double) -> Unit)? = null
+    var onAudioReceived: ((ByteArray, Int) -> Unit)? = null
 
     private var bytesReceived = 0L
     private var framesReceived = 0L
@@ -300,6 +301,15 @@ class StreamClient(
                             val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
                             val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
                             onLatencyMeasured?.invoke(rtt)
+                        }
+
+                        MESSAGE_AUDIO_FRAME -> {
+                            val audioSize = input.readInt()
+                            if (audioSize > 0 && audioSize < 1024 * 1024) {
+                                val audioData = ByteArray(audioSize)
+                                input.readFully(audioData, 0, audioSize)
+                                onAudioReceived?.invoke(audioData, audioSize)
+                            }
                         }
 
                         else -> {
@@ -586,6 +596,7 @@ class StreamClient(
         private const val MESSAGE_VIDEO_FRAME_WITH_METADATA = 6
         private const val MESSAGE_KEYFRAME_REQUEST = 7
         private const val MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA = 8
+        private const val MESSAGE_AUDIO_FRAME = 10
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

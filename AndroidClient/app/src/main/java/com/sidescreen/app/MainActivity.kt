@@ -46,6 +46,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: PreferencesManager
     private var videoDecoder: VideoDecoder? = null
     private var streamClient: StreamClient? = null
+    private val audioPlayer = AudioPlayer()
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var displayWidth = 0 // 0 = no config received yet
     private var displayHeight = 0 // 0 = no config received yet
@@ -834,13 +835,19 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        streamClient?.onAudioReceived = { data, size ->
+            audioPlayer.write(data, 0, size)
+        }
+
         streamClient?.onConnectionStatus = { connected ->
             runOnUiThread {
                 isConnected = connected
                 if (connected) {
                     updateStatus("Connected - Streaming active")
+                    audioPlayer.start()
                 } else {
                     updateStatus("Disconnected")
+                    audioPlayer.stop()
                 }
                 binding.connectButton.isEnabled = !connected
                 binding.disconnectButton.isEnabled = connected
@@ -990,6 +997,10 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
+                streamClient?.onAudioReceived = { data, size ->
+                    audioPlayer.write(data, 0, size)
+                }
+
                 streamClient?.onConnectionStatus = { connected ->
                     runOnUiThread {
                         // Update connection state flag
@@ -997,8 +1008,10 @@ class MainActivity : AppCompatActivity() {
 
                         if (connected) {
                             updateStatus("Connected - Streaming active")
+                            audioPlayer.start()
                         } else {
                             updateStatus("Disconnected")
+                            audioPlayer.stop()
                         }
 
                         binding.connectButton.isEnabled = !connected
@@ -1119,6 +1132,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun disconnect() {
         stopPingTimer()
+        audioPlayer.stop()
         streamClient?.disconnect()
         // Reset display config so next connect defers decoder init until config arrives
         displayWidth = 0

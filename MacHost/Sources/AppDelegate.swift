@@ -233,6 +233,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
+        // Observer for audio enabled/disabled changes
+        settings.$audioEnabled
+            .dropFirst()
+            .sink { [weak self] enabled in
+                guard let self = self, self.settings.isRunning else { return }
+                print("🔊 Audio streaming \(enabled ? "ENABLED" : "DISABLED")")
+                self.screenCapture?.audioEnabled = enabled
+                self.screenCapture?.restartStreamExternal()
+            }
+            .store(in: &cancellables)
+
         // Observer cho connection mode changes — restart server with new auth/ADB policy.
         settings.$connectionMode
             .dropFirst()
@@ -503,6 +514,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Setup capture
             guard let displayID = virtualDisplayManager?.displayID else { return }
             screenCapture = try await ScreenCapture()
+            screenCapture?.audioEnabled = settings.audioEnabled
             screenCapture?.onCaptureMethodChanged = { [weak self] method in
                 guard let self = self else { return }
                 debugLog("Capture method: \(method)")

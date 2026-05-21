@@ -61,6 +61,12 @@ class MainActivity : AppCompatActivity() {
     // Input prediction for low-latency gaming
     private val inputPredictor = InputPredictor()
 
+    // Palm rejection: suppress finger touches while stylus is active
+    private var isStylusActive = false
+    private var palmRejectionRunnable: Runnable? = null
+    private val palmRejectionHandler = Handler(Looper.getMainLooper())
+    private val palmRejectionTimeoutMs = 300L
+
     // Checklist status handler
     private val checklistHandler = Handler(Looper.getMainLooper())
     private var checklistRunnable: Runnable? = null
@@ -1157,35 +1163,76 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun markStylusActive() {
+        palmRejectionRunnable?.let { palmRejectionHandler.removeCallbacks(it) }
+        palmRejectionRunnable = null
+        isStylusActive = true
+    }
+
+    private fun scheduleStylusDeactivation() {
+        palmRejectionRunnable?.let { palmRejectionHandler.removeCallbacks(it) }
+        val runnable = Runnable { isStylusActive = false }
+        palmRejectionRunnable = runnable
+        palmRejectionHandler.postDelayed(runnable, palmRejectionTimeoutMs)
+    }
+
     private fun handleTouch(
         view: View,
         event: MotionEvent,
     ) {
         val toolType = event.getToolType(0)
         val isStylus = toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER
+
         if (isStylus) {
-            val x = event.x / view.width.toFloat()
-            val y = event.y / view.height.toFloat()
-            val pressure = event.pressure.coerceIn(0f, 1f)
-            val orientation = event.getAxisValue(MotionEvent.AXIS_ORIENTATION, 0)
-            val tilt = event.getAxisValue(MotionEvent.AXIS_TILT, 0)
-            var tiltX = 0f
-            var tiltY = 0f
-            if (!tilt.isNaN() && !orientation.isNaN()) {
-                tiltX = kotlin.math.sin(orientation) * kotlin.math.sin(tilt)
-                tiltY = -kotlin.math.cos(orientation) * kotlin.math.sin(tilt)
-            }
+            markStylusActive()
+
             val action = when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> 0
                 MotionEvent.ACTION_MOVE -> 1
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> 2
                 else -> -1
             }
-            if (action != -1) {
-                streamClient?.sendStylus(x, y, pressure, tiltX, tiltY, action, toolType)
+            if (action == -1) return
+
+            // Send batched historical samples for smoother strokes
+            if (action == 1) {
+                val historySize = event.historySize
+                for (h in 0 until historySize) {
+                    val hx = event.getHistoricalX(0, h) / view.width.toFloat()
+                    val hy = event.getHistoricalY(0, h) / view.height.toFloat()
+                    val hp = event.getHistoricalPressure(0, h).coerceIn(0f, 1f)
+                    val hOrientation = event.getHistoricalAxisValue(MotionEvent.AXIS_ORIENTATION, 0, h)
+                    val hTilt = event.getHistoricalAxisValue(MotionEvent.AXIS_TILT, 0, h)
+                    var htx = 0f; var hty = 0f
+                    if (!hTilt.isNaN() && !hOrientation.isNaN()) {
+                        htx = kotlin.math.sin(hOrientation) * kotlin.math.sin(hTilt)
+                        hty = -kotlin.math.cos(hOrientation) * kotlin.math.sin(hTilt)
+                    }
+                    streamClient?.sendStylus(hx, hy, hp, htx, hty, 1, toolType)
+                }
+            }
+
+            // Send the current sample
+            val x = event.x / view.width.toFloat()
+            val y = event.y / view.height.toFloat()
+            val pressure = event.pressure.coerceIn(0f, 1f)
+            val orientation = event.getAxisValue(MotionEvent.AXIS_ORIENTATION, 0)
+            val tilt = event.getAxisValue(MotionEvent.AXIS_TILT, 0)
+            var tiltX = 0f; var tiltY = 0f
+            if (!tilt.isNaN() && !orientation.isNaN()) {
+                tiltX = kotlin.math.sin(orientation) * kotlin.math.sin(tilt)
+                tiltY = -kotlin.math.cos(orientation) * kotlin.math.sin(tilt)
+            }
+            streamClient?.sendStylus(x, y, pressure, tiltX, tiltY, action, toolType)
+
+            if (action == 2) {
+                scheduleStylusDeactivation()
             }
             return
         }
+
+        // Palm rejection: suppress finger events while stylus is active
+        if (isStylusActive) return
 
         val x = event.x / view.width.toFloat()
         val y = event.y / view.height.toFloat()
@@ -1253,6 +1300,8 @@ class MainActivity : AppCompatActivity() {
         val isStylus = toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER
         if (!isStylus) return false
 
+        markStylusActive()
+
         val x = event.x / view.width.toFloat()
         val y = event.y / view.height.toFloat()
         val pressure = 0f
@@ -1275,6 +1324,11 @@ class MainActivity : AppCompatActivity() {
         if (action != -1) {
             streamClient?.sendStylus(x, y, pressure, tiltX, tiltY, action, toolType)
         }
+
+        if (event.actionMasked == MotionEvent.ACTION_HOVER_EXIT) {
+            scheduleStylusDeactivation()
+        }
+
         return true
     }
 

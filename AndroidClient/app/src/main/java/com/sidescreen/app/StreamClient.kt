@@ -361,6 +361,39 @@ class StreamClient(
         }
     }
 
+    fun sendStylus(
+        x: Float,
+        y: Float,
+        pressure: Float,
+        tiltX: Float,
+        tiltY: Float,
+        action: Int,
+        toolType: Int
+    ) {
+        if (!isConnected) return
+
+        touchScope.launch {
+            try {
+                socket?.getOutputStream()?.let { out ->
+                    // Size: 1 byte type (9) + 4 bytes action + 4 bytes x + 4 bytes y + 4 bytes pressure + 4 bytes tiltX + 4 bytes tiltY + 4 bytes toolType = 29 bytes.
+                    val buffer = ByteBuffer.allocate(29).order(ByteOrder.LITTLE_ENDIAN)
+                    buffer.put(9.toByte())
+                    buffer.putInt(action)
+                    buffer.putFloat(x)
+                    buffer.putFloat(y)
+                    buffer.putFloat(pressure)
+                    buffer.putFloat(tiltX)
+                    buffer.putFloat(tiltY)
+                    buffer.putInt(toolType)
+                    out.write(buffer.array())
+                    out.flush()
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+
     // Callback for latency measurement (round-trip ping/pong)
     var onLatencyMeasured: ((Double) -> Unit)? = null
 

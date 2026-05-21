@@ -314,6 +314,10 @@ class MainActivity : AppCompatActivity() {
             handleTouch(view, event)
             true
         }
+
+        binding.surfaceView.setOnHoverListener { view, event ->
+            handleHover(view, event)
+        }
     }
 
     private fun setupUI() {
@@ -1157,6 +1161,32 @@ class MainActivity : AppCompatActivity() {
         view: View,
         event: MotionEvent,
     ) {
+        val toolType = event.getToolType(0)
+        val isStylus = toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER
+        if (isStylus) {
+            val x = event.x / view.width.toFloat()
+            val y = event.y / view.height.toFloat()
+            val pressure = event.pressure.coerceIn(0f, 1f)
+            val orientation = event.getAxisValue(MotionEvent.AXIS_ORIENTATION, 0)
+            val tilt = event.getAxisValue(MotionEvent.AXIS_TILT, 0)
+            var tiltX = 0f
+            var tiltY = 0f
+            if (!tilt.isNaN() && !orientation.isNaN()) {
+                tiltX = kotlin.math.sin(orientation) * kotlin.math.sin(tilt)
+                tiltY = -kotlin.math.cos(orientation) * kotlin.math.sin(tilt)
+            }
+            val action = when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> 0
+                MotionEvent.ACTION_MOVE -> 1
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> 2
+                else -> -1
+            }
+            if (action != -1) {
+                streamClient?.sendStylus(x, y, pressure, tiltX, tiltY, action, toolType)
+            }
+            return
+        }
+
         val x = event.x / view.width.toFloat()
         val y = event.y / view.height.toFloat()
         val pointerCount = event.pointerCount.coerceAtMost(5)
@@ -1213,6 +1243,39 @@ class MainActivity : AppCompatActivity() {
                 streamClient?.sendTouch(x, y, 2, 1)
             }
         }
+    }
+
+    private fun handleHover(
+        view: View,
+        event: MotionEvent,
+    ): Boolean {
+        val toolType = event.getToolType(0)
+        val isStylus = toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER
+        if (!isStylus) return false
+
+        val x = event.x / view.width.toFloat()
+        val y = event.y / view.height.toFloat()
+        val pressure = 0f
+        val orientation = event.getAxisValue(MotionEvent.AXIS_ORIENTATION, 0)
+        val tilt = event.getAxisValue(MotionEvent.AXIS_TILT, 0)
+        var tiltX = 0f
+        var tiltY = 0f
+        if (!tilt.isNaN() && !orientation.isNaN()) {
+            tiltX = kotlin.math.sin(orientation) * kotlin.math.sin(tilt)
+            tiltY = -kotlin.math.cos(orientation) * kotlin.math.sin(tilt)
+        }
+
+        val action = when (event.actionMasked) {
+            MotionEvent.ACTION_HOVER_MOVE -> 3
+            MotionEvent.ACTION_HOVER_EXIT -> 4
+            MotionEvent.ACTION_HOVER_ENTER -> 3
+            else -> -1
+        }
+
+        if (action != -1) {
+            streamClient?.sendStylus(x, y, pressure, tiltX, tiltY, action, toolType)
+        }
+        return true
     }
 
     /**

@@ -528,6 +528,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2, extraPointers: extraPointers)
             }
 
+            streamingServer?.onStylusEvent = { [weak self] x, y, pressure, tiltX, tiltY, action, toolType in
+                self?.handleStylus(x: x, y: y, pressure: pressure, tiltX: tiltX, tiltY: tiltY, action: action, toolType: toolType)
+            }
+
             streamingServer?.onStats = { [weak self] fps, mbps in
                 let captured = self
                 Task { @MainActor in
@@ -578,6 +582,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.clientConnected = false
         settings.currentFPS = 0
         settings.currentBitrate = 0
+        isStylusInProximity = false
+        currentStylusToolType = 0
 
         print("⏹️ Server stopped")
     }
@@ -590,6 +596,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastTouchTime: UInt64 = 0
     private let keyboardQueue = DispatchQueue(label: "com.sidescreen.keyboardQueue", qos: .userInitiated)
     private var lastZoomTime: UInt64 = 0
+    private var isStylusInProximity = false
+    private var currentStylusToolType = 0
 
     private func setGestureState(_ newState: GestureState) {
         let oldState = gestureState
@@ -679,6 +687,87 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             handleTwoFingerTouch(p1: p1, p2: p2, action: action)
         } else {
             handleOneFingerTouch(at: p1, action: action)
+        }
+    }
+
+    func handleStylus(x: Float, y: Float, pressure: Float, tiltX: Float, tiltY: Float, action: Int, toolType: Int) {
+        guard settings.touchEnabled else { return }
+
+        if !AXIsProcessTrusted() {
+            return
+        }
+
+        guard let displayID = virtualDisplayManager?.displayID else { return }
+        let bounds = CGDisplayBounds(displayID)
+
+        let point = CGPoint(
+            x: bounds.origin.x + CGFloat(x) * bounds.width,
+            y: bounds.origin.y + CGFloat(y) * bounds.height
+        )
+
+        let pointerType = toolType == 4 ? 2 : 1 // 1 = Pen, 2 = Eraser
+
+        // Check if we need to send proximity event
+        if !isStylusInProximity || currentStylusToolType != toolType {
+            sendTabletProximityEvent(enterProximity: true, pointerType: pointerType)
+            isStylusInProximity = true
+            currentStylusToolType = toolType
+        }
+
+        if action == 4 { // Hover exit
+            sendTabletProximityEvent(enterProximity: false, pointerType: pointerType)
+            isStylusInProximity = false
+            return
+        }
+
+        // Focus window on tap-down
+        if action == 0 {
+            focusWindowAtPoint(point)
+        }
+
+        // Synthesize the appropriate mouse type event with tablet subtype
+        let mouseType: CGEventType
+        let mouseButton: CGMouseButton
+        switch action {
+        case 0:
+            mouseType = .leftMouseDown
+            mouseButton = .left
+        case 1:
+            mouseType = .leftMouseDragged
+            mouseButton = .left
+        case 2:
+            mouseType = .leftMouseUp
+            mouseButton = .left
+        case 3:
+            mouseType = .mouseMoved
+            mouseButton = .left
+        default:
+            return
+        }
+
+        if let event = CGEvent(mouseEventSource: eventSource, mouseType: mouseType, mouseCursorPosition: point, mouseButton: mouseButton) {
+            if action == 0 || action == 2 {
+                event.setIntegerValueField(.mouseEventClickState, value: 1)
+            }
+            event.setIntegerValueField(.mouseEventSubtype, value: 1) // kCGEventMouseSubtypeTabletPoint = 1
+            event.setDoubleValueField(.tabletEventPointPressure, value: Double(pressure))
+            event.setDoubleValueField(.tabletEventTiltX, value: Double(tiltX))
+            event.setDoubleValueField(.tabletEventTiltY, value: Double(tiltY))
+            event.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func sendTabletProximityEvent(enterProximity: Bool, pointerType: Int) {
+        if let event = CGEvent(source: eventSource) {
+            event.type = .tabletProximity
+            event.setIntegerValueField(.tabletProximityEventPointerType, value: Int64(pointerType))
+            event.setIntegerValueField(.tabletProximityEventEnterProximity, value: enterProximity ? 1 : 0)
+            event.setIntegerValueField(.tabletProximityEventVendorID, value: 0x056a)
+            event.setIntegerValueField(.tabletProximityEventTabletID, value: 1)
+            event.setIntegerValueField(.tabletProximityEventPointerID, value: 1)
+            event.setIntegerValueField(.tabletProximityEventDeviceID, value: 1)
+            event.setIntegerValueField(.tabletProximityEventSystemTabletID, value: 1)
+            event.post(tap: .cghidEventTap)
         }
     }
 

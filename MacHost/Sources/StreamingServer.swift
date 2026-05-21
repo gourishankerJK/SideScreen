@@ -10,6 +10,7 @@ private enum WireMessage {
     static let videoFrameWithMetadata: UInt8 = 6
     static let keyframeRequest: UInt8 = 7
     static let clientSupportsFrameMetadata: UInt8 = 8
+    static let stylusEvent: UInt8 = 9
 }
 
 private extension NWEndpoint {
@@ -36,6 +37,8 @@ class StreamingServer {
     var onClientDisconnected: (() -> Void)?
     // Touch callback: (x1, y1, action, pointerCount, x2, y2, extraPointers)
     var onTouchEvent: ((Float, Float, Int, Int, Float, Float, [Float]) -> Void)?
+    // Stylus callback: (x, y, pressure, tiltX, tiltY, action, toolType)
+    var onStylusEvent: ((Float, Float, Float, Float, Float, Int, Int) -> Void)?
     var onStats: ((Double, Double) -> Void)?
     var onKeyframeRequested: ((Bool) -> Void)?
     // Whether host wants to receive touch events from client. Ping/pong is
@@ -368,6 +371,17 @@ class StreamingServer {
                 }
                 finishProtocolStartup(on: connection)
 
+            case WireMessage.stylusEvent:
+                // Stylus event: 1 type + 4 action + 4 x + 4 y + 4 pressure + 4 tiltX + 4 tiltY + 4 toolType = 29 bytes.
+                guard inputBuffer.count >= 29 else { return }
+
+                let message = Data(inputBuffer.prefix(29))
+                consumeInputBytes(29)
+
+                if touchEnabled {
+                    handleStylusMessage(message)
+                }
+
             default:
                 debugLog("Unknown client input type: \(msgType)")
                 consumeInputBytes(1)
@@ -403,6 +417,20 @@ class StreamingServer {
 
         DispatchQueue.main.async {
             self.onTouchEvent?(x1, y1, Int(action), pointerCount, x2, y2, extraPointers)
+        }
+    }
+
+    private func handleStylusMessage(_ data: Data) {
+        let action = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 1, as: Int32.self) }
+        let x = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 5, as: Float.self) }
+        let y = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 9, as: Float.self) }
+        let pressure = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 13, as: Float.self) }
+        let tiltX = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 17, as: Float.self) }
+        let tiltY = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 21, as: Float.self) }
+        let toolType = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 25, as: Int32.self) }
+
+        DispatchQueue.main.async {
+            self.onStylusEvent?(x, y, pressure, tiltX, tiltY, Int(action), Int(toolType))
         }
     }
 

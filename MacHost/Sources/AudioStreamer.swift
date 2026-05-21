@@ -4,6 +4,7 @@ import CoreMedia
 
 @available(macOS 14.0, *)
 class AudioStreamer {
+    private let lock = NSLock()
     private var cachedInputFormat: AVAudioFormat?
     private var converter: AVAudioConverter?
     private let targetFormat: AVAudioFormat
@@ -21,6 +22,9 @@ class AudioStreamer {
     }
     
     func processAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        lock.lock()
+        defer { lock.unlock() }
+        
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
         var asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)!.pointee
         

@@ -32,6 +32,8 @@ enum GestureState {
     case dragging         // Long press + drag (left mouse drag)
     case twoFingerScroll  // 2-finger scroll
     case pinching         // Pinch zoom
+    case twoFingerHSwipe  // 2-finger horizontal swipe (back/forward)
+    case threeFingerSwipe // 3-finger directional swipe
 }
 
 struct GestureThresholds {
@@ -43,6 +45,9 @@ struct GestureThresholds {
     static let scrollSensitivity: CGFloat = 1.2
     static let pinchMinDistance: CGFloat = 20
     static let minTouchInterval: UInt64 = 8_000_000    // ~120Hz
+    static let swipeMinDistance: CGFloat = 80           // Min distance for swipe gesture
+    static let swipeMaxCrossAxis: CGFloat = 60          // Max perpendicular movement for swipe
+    static let hSwipeRatio: CGFloat = 2.0               // Horizontal/vertical ratio for h-swipe
 }
 
 @available(macOS 14.0, *)
@@ -278,9 +283,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             settings.hasAccessibilityPermission = trusted
         }
         if trusted {
-            print("✅ Accessibility permission granted")
+            debugLog("✅ Accessibility permission granted")
         } else {
-            print("⚠️  Accessibility permission not granted - touch control will not work")
+            debugLog("⚠️  Accessibility permission not granted - touch control will not work")
         }
     }
 
@@ -519,8 +524,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            streamingServer?.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2 in
-                self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
+            streamingServer?.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2, extraPointers in
+                self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2, extraPointers: extraPointers)
             }
 
             streamingServer?.onStats = { [weak self] fps, mbps in
@@ -583,6 +588,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var accessibilityWarningShown = false
     private var gestureState: GestureState = .idle
     private var lastTouchTime: UInt64 = 0
+    private let keyboardQueue = DispatchQueue(label: "com.sidescreen.keyboardQueue", qos: .userInitiated)
+    private var lastZoomTime: UInt64 = 0
+
+    private func setGestureState(_ newState: GestureState) {
+        let oldState = gestureState
+        if oldState == newState { return }
+        
+        debugLog("Gesture state transition: \(oldState) -> \(newState)")
+        
+        gestureState = newState
+    }
 
     // Touch tracking
     private var touchStartPosition: CGPoint = .zero
@@ -602,6 +618,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // 2-finger tracking
     private var initialPinchDistance: CGFloat = 0
     private var lastPinchDistance: CGFloat = 0
+    private var twoFingerStartMidpoint: CGPoint = .zero
+    private var twoFingerStartTime: UInt64 = 0
+
+    // 3-finger tracking
+    private var threeFingerStartMidpoint: CGPoint = .zero
+    private var threeFingerStartTime: UInt64 = 0
 
     // Momentum scrolling
     private var momentumTimer: Timer?
@@ -611,13 +633,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Touch Entry Point
 
-    func handleTouch(x: Float, y: Float, action: Int, pointerCount: Int = 1, x2: Float = 0, y2: Float = 0) {
+    func handleTouch(x: Float, y: Float, action: Int, pointerCount: Int = 1, x2: Float = 0, y2: Float = 0, extraPointers: [Float] = []) {
+        if action == 0 || action == 2 || pointerCount > 1 {
+            debugLog("handleTouch: action=\(action), pointerCount=\(pointerCount), (x,y)=(\(x),\(y)), x2=\(x2), y2=\(y2), extraPointersCount=\(extraPointers.count)")
+        }
+
         guard settings.touchEnabled else { return }
 
         if !AXIsProcessTrusted() {
             if !accessibilityWarningShown {
                 accessibilityWarningShown = true
-                print("⚠️  Accessibility not granted - touch ignored")
+                debugLog("⚠️  Accessibility not granted - touch ignored")
                 Task { @MainActor in
                     settings.hasAccessibilityPermission = false
                 }
@@ -637,7 +663,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             y: bounds.origin.y + CGFloat(y2) * bounds.height
         )
 
-        if pointerCount >= 2 {
+        // Convert extra pointers to screen coordinates
+        var extraPoints: [CGPoint] = []
+        for i in stride(from: 0, to: extraPointers.count - 1, by: 2) {
+            let ep = CGPoint(
+                x: bounds.origin.x + CGFloat(extraPointers[i]) * bounds.width,
+                y: bounds.origin.y + CGFloat(extraPointers[i + 1]) * bounds.height
+            )
+            extraPoints.append(ep)
+        }
+
+        if pointerCount >= 3 {
+            handleThreeFingerTouch(p1: p1, p2: p2, extraPoints: extraPoints, action: action)
+        } else if pointerCount >= 2 {
             handleTwoFingerTouch(p1: p1, p2: p2, action: action)
         } else {
             handleOneFingerTouch(at: p1, action: action)
@@ -663,15 +701,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         touchLastPosition = point
         touchStartTime = DispatchTime.now().uptimeNanoseconds
         touchLastMoveTime = touchStartTime
-        gestureState = .pending
+        setGestureState(.pending)
 
-        // Move cursor to touch position (absolute)
+        // Move cursor to touch position (absolute) and focus the window/app under the touch point
         moveCursor(to: point)
+        focusWindowAtPoint(point)
 
         // Start long press timer
         let timer = DispatchWorkItem { [weak self] in
             guard let self, self.gestureState == .pending else { return }
-            self.gestureState = .longPressReady
+            self.setGestureState(.longPressReady)
         }
         longPressTimer = timer
         DispatchQueue.main.asyncAfter(
@@ -693,7 +732,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .pending:
             if totalDistance > GestureThresholds.tapMaxDistance {
                 cancelLongPressTimer()
-                gestureState = .scrolling
+                setGestureState(.scrolling)
                 let sx = deltaX * GestureThresholds.scrollSensitivity
                 let sy = deltaY * GestureThresholds.scrollSensitivity
                 injectScrollEvent(deltaX: sx, deltaY: sy, at: point)
@@ -704,7 +743,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .longPressReady:
             if totalDistance > GestureThresholds.tapMaxDistance {
                 // Long press + drag → left mouse drag
-                gestureState = .dragging
+                setGestureState(.dragging)
                 injectMouseDown(at: touchStartPosition)
                 injectMouseDragged(to: point)
             }
@@ -780,7 +819,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             break
         }
 
-        gestureState = .idle
+        setGestureState(.idle)
     }
 
     // MARK: - 2-Finger Gestures
@@ -793,10 +832,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case 0: // Down
             cancelLongPressTimer()
             stopMomentumScroll()
-            gestureState = .idle  // Reset so 2-finger detection starts fresh
+            setGestureState(.idle)  // Reset so 2-finger detection starts fresh
             initialPinchDistance = distance
             lastPinchDistance = distance
             touchLastPosition = midpoint
+            twoFingerStartMidpoint = midpoint
+            twoFingerStartTime = DispatchTime.now().uptimeNanoseconds
+            debugLog("Two-finger DOWN: midpoint=(\(midpoint.x), \(midpoint.y)), dist=\(distance)")
+            
+            // Move cursor to the midpoint and focus the window/app under the fingers
+            moveCursor(to: midpoint)
+            focusWindowAtPoint(midpoint)
 
         case 1: // Move
             let distanceChange = abs(distance - initialPinchDistance)
@@ -805,9 +851,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Determine mode if not yet decided
             if gestureState != .twoFingerScroll && gestureState != .pinching {
                 if distanceChange > GestureThresholds.pinchMinDistance {
-                    gestureState = .pinching
+                    setGestureState(.pinching)
+                    lastPinchDistance = distance // set baseline when pinch starts
+                    debugLog("Two-finger transition to PINCHING (distChange=\(distanceChange))")
                 } else if midDelta > GestureThresholds.tapMaxDistance {
-                    gestureState = .twoFingerScroll
+                    setGestureState(.twoFingerScroll)
+                    debugLog("Two-finger transition to SCROLLING (midDelta=\(midDelta))")
                 }
             }
 
@@ -819,12 +868,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             case .pinching:
                 let scaleDelta = distance - lastPinchDistance
-                // Cmd + scroll = zoom in most Mac apps
-                let zoomAmount = Int32(scaleDelta * 0.5)
+                // Calculate zoomAmount using a lower factor so slow zoom accumulates properly
+                let zoomAmount = Int32(scaleDelta * 0.15)
                 if zoomAmount != 0 {
-                    injectZoomEvent(delta: zoomAmount, at: midpoint)
+                    if injectZoomEvent(delta: zoomAmount, at: midpoint) {
+                        debugLog("Pinching: distance=\(distance), scaleDelta=\(scaleDelta), injecting zoomAmount=\(zoomAmount)")
+                        lastPinchDistance = distance // Only update on successful zoom injection to accumulate slow pinch movement
+                    }
                 }
-                lastPinchDistance = distance
 
             default:
                 break
@@ -833,7 +884,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             touchLastPosition = midpoint
 
         case 2: // Up
-            gestureState = .idle
+            debugLog("Two-finger UP: state=\(gestureState)")
+            // Check for 2-finger horizontal swipe (back/forward)
+            if gestureState == .twoFingerScroll {
+                let totalDx = midpoint.x - twoFingerStartMidpoint.x
+                let totalDy = midpoint.y - twoFingerStartMidpoint.y
+                let absDx = abs(totalDx)
+                let absDy = abs(totalDy)
+                let elapsed = DispatchTime.now().uptimeNanoseconds - twoFingerStartTime
+                debugLog("Two-finger swipe check: totalDx=\(totalDx), totalDy=\(totalDy), elapsed=\(Double(elapsed)/1_000_000_000)s")
+                // Detect quick horizontal swipe: primarily horizontal, fast, sufficient distance
+                if absDx > GestureThresholds.swipeMinDistance
+                    && absDy < GestureThresholds.swipeMaxCrossAxis
+                    && absDx > absDy * GestureThresholds.hSwipeRatio
+                    && elapsed < 600_000_000 { // < 600ms
+                    if totalDx > 0 {
+                        debugLog("Two-finger swipe detected: RIGHT (Forward)")
+                        // Swipe right → forward: Cmd + ] (0x1E)
+                        injectAppKeyCombo(keyCode: 0x1E, flags: .maskCommand)
+                    } else {
+                        debugLog("Two-finger swipe detected: LEFT (Back)")
+                        // Swipe left → back: Cmd + [ (0x21)
+                        injectAppKeyCombo(keyCode: 0x21, flags: .maskCommand)
+                    }
+                }
+            }
+            setGestureState(.idle)
             // Reset 1-finger tracking so leftover moves don't trigger scroll
             touchStartPosition = .zero
             touchLastPosition = .zero
@@ -843,7 +919,114 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - 3-Finger Gestures
+
+    private func handleThreeFingerTouch(p1: CGPoint, p2: CGPoint, extraPoints: [CGPoint], action: Int) {
+        // Calculate midpoint of all 3 fingers
+        var allPoints = [p1, p2]
+        allPoints.append(contentsOf: extraPoints)
+        let count = CGFloat(allPoints.count)
+        let midpoint = CGPoint(
+            x: allPoints.reduce(0) { $0 + $1.x } / count,
+            y: allPoints.reduce(0) { $0 + $1.y } / count
+        )
+
+        switch action {
+        case 0: // Down
+            cancelLongPressTimer()
+            stopMomentumScroll()
+            setGestureState(.threeFingerSwipe)
+            threeFingerStartMidpoint = midpoint
+            threeFingerStartTime = DispatchTime.now().uptimeNanoseconds
+            debugLog("Three-finger DOWN: midpoint=(\(midpoint.x), \(midpoint.y)), fingersCount=\(allPoints.count)")
+
+        case 1: // Move — no continuous action, just tracking
+            break
+
+        case 2: // Up — determine swipe direction
+            guard gestureState == .threeFingerSwipe else {
+                debugLog("Three-finger UP ignored: state was not threeFingerSwipe (\(gestureState))")
+                setGestureState(.idle)
+                return
+            }
+            let dx = midpoint.x - threeFingerStartMidpoint.x
+            let dy = midpoint.y - threeFingerStartMidpoint.y
+            let absDx = abs(dx)
+            let absDy = abs(dy)
+            let elapsed = DispatchTime.now().uptimeNanoseconds - threeFingerStartTime
+            debugLog("Three-finger swipe check: dx=\(dx), dy=\(dy), elapsed=\(Double(elapsed)/1_000_000_000)s")
+
+            // Must be a quick, deliberate swipe
+            guard elapsed < 800_000_000 else { // < 800ms
+                debugLog("Three-finger swipe ignored: elapsed time (\(Double(elapsed)/1_000_000_000)s) too long")
+                setGestureState(.idle)
+                return
+            }
+
+            if absDx > absDy && absDx > GestureThresholds.swipeMinDistance {
+                // Horizontal swipe — switch Space
+                if dx > 0 {
+                    debugLog("Three-finger swipe detected: RIGHT (next Space)")
+                    // 3-finger swipe right → Ctrl+Right (next Space)
+                    injectSystemKeyCombo(keyCode: 0x7C, flags: .maskControl) // Right arrow
+                } else {
+                    debugLog("Three-finger swipe detected: LEFT (previous Space)")
+                    // 3-finger swipe left → Ctrl+Left (previous Space)
+                    injectSystemKeyCombo(keyCode: 0x7B, flags: .maskControl) // Left arrow
+                }
+            } else if absDy > absDx && absDy > GestureThresholds.swipeMinDistance {
+                // Vertical swipe
+                if dy < 0 {
+                    debugLog("Three-finger swipe detected: UP (Mission Control)")
+                    // 3-finger swipe up → Ctrl+Up (Mission Control)
+                    injectSystemKeyCombo(keyCode: 0x7E, flags: .maskControl) // Up arrow
+                } else {
+                    debugLog("Three-finger swipe detected: DOWN (App Exposé)")
+                    // 3-finger swipe down → Ctrl+Down (App Exposé)
+                    injectSystemKeyCombo(keyCode: 0x7D, flags: .maskControl) // Down arrow
+                }
+            } else {
+                debugLog("Three-finger swipe ignored: too short (dx=\(dx), dy=\(dy), min=\(GestureThresholds.swipeMinDistance))")
+            }
+
+            setGestureState(.idle)
+
+        default:
+            break
+        }
+    }
+
     // MARK: - Event Injection
+
+    private func focusWindowAtPoint(_ point: CGPoint) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+            guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+                return
+            }
+            
+            for window in windowList {
+                guard let layer = window[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
+                guard let boundsDict = window[kCGWindowBounds as String] as? [String: Any],
+                      let rect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else {
+                    continue
+                }
+                
+                if rect.contains(point) {
+                    if let pid = window[kCGWindowOwnerPID as String] as? pid_t {
+                        DispatchQueue.main.async {
+                            if let app = NSRunningApplication(processIdentifier: pid) {
+                                if !app.isActive {
+                                    app.activate(options: [.activateIgnoringOtherApps])
+                                }
+                            }
+                        }
+                        break
+                    }
+                }
+            }
+        }
+    }
 
     private func moveCursor(to point: CGPoint) {
         if let event = CGEvent(mouseEventSource: eventSource, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) {
@@ -914,19 +1097,83 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         scrollEvent.post(tap: .cghidEventTap)
     }
 
-    private func injectZoomEvent(delta: Int32, at position: CGPoint) {
-        guard let scrollEvent = CGEvent(
-            scrollWheelEvent2Source: eventSource,
-            units: .pixel,
-            wheelCount: 1,
-            wheel1: delta,
-            wheel2: 0,
-            wheel3: 0
-        ) else { return }
-        scrollEvent.location = position
-        // Set Cmd flag for zoom
-        scrollEvent.flags = .maskCommand
-        scrollEvent.post(tap: .cghidEventTap)
+    private func injectZoomEvent(delta: Int32, at position: CGPoint) -> Bool {
+        let now = DispatchTime.now().uptimeNanoseconds
+        // Throttle to 100ms to allow smooth zooming without overloading the target application
+        guard now - lastZoomTime >= 100_000_000 else { return false }
+        lastZoomTime = now
+        
+        let keyCode: CGKeyCode = delta > 0 ? 0x18 : 0x1B // 0x18 is '=', 0x1B is '-'
+        injectAppKeyCombo(keyCode: keyCode, flags: .maskCommand)
+        return true
+    }
+
+    private func injectAppKeyCombo(keyCode: CGKeyCode, flags: CGEventFlags) {
+        keyboardQueue.async { [weak self] in
+            guard let self = self else { return }
+            if let keyDown = CGEvent(keyboardEventSource: self.eventSource, virtualKey: keyCode, keyDown: true) {
+                keyDown.flags = flags
+                keyDown.post(tap: .cghidEventTap)
+            }
+            usleep(10000) // 10ms delay to prevent target apps from missing or sticking keys
+            if let keyUp = CGEvent(keyboardEventSource: self.eventSource, virtualKey: keyCode, keyDown: false) {
+                keyUp.flags = flags
+                keyUp.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
+    private func injectSystemKeyCombo(keyCode: CGKeyCode, flags: CGEventFlags) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            var modifiers: [(CGKeyCode, CGEventFlags)] = []
+            if flags.contains(.maskControl) {
+                modifiers.append((0x3B, .maskControl))
+            }
+            if flags.contains(.maskCommand) {
+                modifiers.append((0x37, .maskCommand))
+            }
+            if flags.contains(.maskAlternate) {
+                modifiers.append((0x3A, .maskAlternate))
+            }
+            if flags.contains(.maskShift) {
+                modifiers.append((0x38, .maskShift))
+            }
+            
+            // Post modifier down events
+            var currentFlags: CGEventFlags = []
+            for (modKey, flag) in modifiers {
+                currentFlags.insert(flag)
+                if let modDown = CGEvent(keyboardEventSource: self.eventSource, virtualKey: modKey, keyDown: true) {
+                    modDown.flags = currentFlags
+                    modDown.post(tap: .cghidEventTap)
+                }
+                usleep(15000) // 15ms delay
+            }
+            
+            // Post actual key events
+            if let keyDown = CGEvent(keyboardEventSource: self.eventSource, virtualKey: keyCode, keyDown: true) {
+                keyDown.flags = flags
+                keyDown.post(tap: .cghidEventTap)
+            }
+            usleep(15000) // 15ms delay
+            
+            if let keyUp = CGEvent(keyboardEventSource: self.eventSource, virtualKey: keyCode, keyDown: false) {
+                keyUp.flags = flags
+                keyUp.post(tap: .cghidEventTap)
+            }
+            usleep(15000) // 15ms delay
+            
+            // Post modifier up events in reverse order
+            for (modKey, flag) in modifiers.reversed() {
+                currentFlags.remove(flag)
+                if let modUp = CGEvent(keyboardEventSource: self.eventSource, virtualKey: modKey, keyDown: false) {
+                    modUp.flags = currentFlags
+                    modUp.post(tap: .cghidEventTap)
+                }
+                usleep(15000) // 15ms delay
+            }
+        }
     }
 
     // MARK: - Long Press Timer

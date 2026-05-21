@@ -1159,7 +1159,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         val x = event.x / view.width.toFloat()
         val y = event.y / view.height.toFloat()
-        val pointerCount = event.pointerCount.coerceAtMost(2)
+        val pointerCount = event.pointerCount.coerceAtMost(5)
 
         var x2 = 0f
         var y2 = 0f
@@ -1168,15 +1168,25 @@ class MainActivity : AppCompatActivity() {
             y2 = event.getY(1) / view.height.toFloat()
         }
 
+        // Collect coordinates for pointers 3–5 (indices 2–4)
+        var extraPointers: FloatArray? = null
+        if (pointerCount >= 3) {
+            extraPointers = FloatArray((pointerCount - 2) * 2)
+            for (i in 2 until pointerCount) {
+                extraPointers[(i - 2) * 2] = event.getX(i) / view.width.toFloat()
+                extraPointers[(i - 2) * 2 + 1] = event.getY(i) / view.height.toFloat()
+            }
+        }
+
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 inputPredictor.reset()
                 inputPredictor.addSample(x, y)
-                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
+                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2, extraPointers)
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
-                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
+                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2, extraPointers)
             }
 
             MotionEvent.ACTION_MOVE -> {
@@ -1185,7 +1195,7 @@ class MainActivity : AppCompatActivity() {
                     val (px, py) = inputPredictor.predictPosition(12f)
                     streamClient?.sendTouch(px, py, 1, 1)
                 } else {
-                    streamClient?.sendTouch(x, y, 1, pointerCount, x2, y2)
+                    streamClient?.sendTouch(x, y, 1, pointerCount, x2, y2, extraPointers)
                 }
             }
 
@@ -1195,7 +1205,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
-                streamClient?.sendTouch(x, y, 2, pointerCount, x2, y2)
+                streamClient?.sendTouch(x, y, 2, pointerCount, x2, y2, extraPointers)
             }
 
             MotionEvent.ACTION_CANCEL -> {

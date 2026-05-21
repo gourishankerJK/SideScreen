@@ -34,8 +34,8 @@ class StreamingServer {
     private var connection: NWConnection?
     var onClientConnected: (() -> Void)?
     var onClientDisconnected: (() -> Void)?
-    // Touch callback: (x1, y1, action, pointerCount, x2, y2)
-    var onTouchEvent: ((Float, Float, Int, Int, Float, Float) -> Void)?
+    // Touch callback: (x1, y1, action, pointerCount, x2, y2, extraPointers)
+    var onTouchEvent: ((Float, Float, Int, Int, Float, Float, [Float]) -> Void)?
     var onStats: ((Double, Double) -> Void)?
     var onKeyframeRequested: ((Bool) -> Void)?
     // Whether host wants to receive touch events from client. Ping/pong is
@@ -79,7 +79,7 @@ class StreamingServer {
             // Optimize TCP for low-latency streaming
             if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
                 tcpOptions.noDelay = true  // Disable Nagle's algorithm
-                tcpOptions.enableFastOpen = true
+                // tcpOptions.enableFastOpen = true
             }
 
             listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
@@ -319,7 +319,7 @@ class StreamingServer {
                 guard inputBuffer.count >= 2 else { return }
 
                 let pointerCount = Int(inputByte(at: 1))
-                guard pointerCount == 1 || pointerCount == 2 else {
+                guard (1...5).contains(pointerCount) else {
                     debugLog("Invalid touch pointer count: \(pointerCount)")
                     consumeInputBytes(1)
                     continue
@@ -386,11 +386,23 @@ class StreamingServer {
             y2 = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 14, as: Float.self) }
         }
 
+        // Parse extra pointers (3–5)
+        var extraPointers: [Float] = []
+        if pointerCount >= 3 {
+            for i in 2..<pointerCount {
+                let offset = 2 + i * 8
+                let px = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: Float.self) }
+                let py = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset + 4, as: Float.self) }
+                extraPointers.append(px)
+                extraPointers.append(py)
+            }
+        }
+
         let actionOffset = 2 + pointerCount * 8
         let action = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: actionOffset, as: Int32.self) }
 
         DispatchQueue.main.async {
-            self.onTouchEvent?(x1, y1, Int(action), pointerCount, x2, y2)
+            self.onTouchEvent?(x1, y1, Int(action), pointerCount, x2, y2, extraPointers)
         }
     }
 

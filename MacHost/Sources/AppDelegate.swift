@@ -95,8 +95,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             refreshStatusIndicators()
         }
 
+        // Observe screen wake/unlock to re-validate virtual display
+        setupScreenWakeObservers()
+
         // Show settings window
         showSettings()
+    }
+
+    private func setupScreenWakeObservers() {
+        let wsc = NSWorkspace.shared.notificationCenter
+        wsc.addObserver(self, selector: #selector(handleScreenWake), name: NSWorkspace.screensDidWakeNotification, object: nil)
+        wsc.addObserver(self, selector: #selector(handleScreenWake), name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+
+        // Also observe distributed notification for screen unlock
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleScreenWake),
+            name: NSNotification.Name("com.apple.screenIsUnlocked"),
+            object: nil
+        )
+    }
+
+    @objc private func handleScreenWake(_ notification: Notification) {
+        debugLog("Screen wake/unlock detected: \(notification.name.rawValue)")
+        // After wake, macOS may temporarily lose track of virtual display bounds.
+        // Clear cached bounds so the next touch re-fetches them.
+        cachedDisplayBounds = nil
+        cachedDisplayBoundsTime = 0
+
+        // Re-validate the display with a short delay to let macOS settle
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, let vdm = self.virtualDisplayManager, vdm.isActive else { return }
+            let registered = vdm.verifyDisplayRegistered()
+            debugLog("Post-wake display check: registered=\(registered)")
+            // Refresh cached bounds
+            self.cachedDisplayBounds = nil
+            self.cachedDisplayBoundsTime = 0
+        }
     }
 
     @MainActor
@@ -599,6 +634,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isStylusInProximity = false
     private var currentStylusToolType = 0
 
+    // Cached display bounds to avoid repeated CGDisplayBounds calls
+    // and to survive brief post-wake periods where bounds return zero.
+    private var cachedDisplayBounds: CGRect?
+    private var cachedDisplayBoundsTime: UInt64 = 0
+    private let displayBoundsCacheDurationNs: UInt64 = 2_000_000_000 // 2 seconds
+
+    /// Menu bar overshoot: how many pixels above the display top edge the cursor
+    /// is allowed to travel so macOS can trigger the auto-hide menu bar.
+    private let menuBarOvershootPx: CGFloat = 5
+
     private func setGestureState(_ newState: GestureState) {
         let oldState = gestureState
         if oldState == newState { return }
@@ -660,12 +705,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard let displayID = virtualDisplayManager?.displayID else { return }
-        let bounds = CGDisplayBounds(displayID)
+        let bounds = getDisplayBounds(displayID)
 
-        let p1 = CGPoint(
-            x: bounds.origin.x + CGFloat(x) * bounds.width,
-            y: bounds.origin.y + CGFloat(y) * bounds.height
-        )
+        // For single-finger touches, use mapToDisplayPoint which allows cursor
+        // to overshoot above the display for menu bar access in fullscreen apps.
+        let p1 = pointerCount == 1
+            ? mapToDisplayPoint(x: x, y: y, bounds: bounds)
+            : CGPoint(x: bounds.origin.x + CGFloat(x) * bounds.width,
+                       y: bounds.origin.y + CGFloat(y) * bounds.height)
         let p2 = CGPoint(
             x: bounds.origin.x + CGFloat(x2) * bounds.width,
             y: bounds.origin.y + CGFloat(y2) * bounds.height
@@ -698,7 +745,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard let displayID = virtualDisplayManager?.displayID else { return }
-        let bounds = CGDisplayBounds(displayID)
+        let bounds = getDisplayBounds(displayID)
 
         let point = CGPoint(
             x: bounds.origin.x + CGFloat(x) * bounds.width,
@@ -1083,6 +1130,51 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         default:
             break
         }
+    }
+
+    // MARK: - Display Bounds Helpers
+
+    /// Returns cached display bounds, refreshing from CGDisplayBounds periodically.
+    /// After wake/unlock, cached bounds are cleared so a fresh lookup occurs.
+    /// If the fresh lookup returns zero-size bounds (transient post-wake state),
+    /// falls back to the last known good bounds.
+    private func getDisplayBounds(_ displayID: CGDirectDisplayID) -> CGRect {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if let cached = cachedDisplayBounds,
+           now - cachedDisplayBoundsTime < displayBoundsCacheDurationNs {
+            return cached
+        }
+
+        let fresh = CGDisplayBounds(displayID)
+
+        // If macOS returns zero-size bounds (post-wake glitch), keep old cached value
+        if fresh.width > 0 && fresh.height > 0 {
+            cachedDisplayBounds = fresh
+            cachedDisplayBoundsTime = now
+            return fresh
+        } else if let cached = cachedDisplayBounds {
+            debugLog("getDisplayBounds: fresh bounds zero, using cached (\(cached))")
+            return cached
+        }
+
+        // No cache and fresh is zero — return fresh anyway (shouldn't happen)
+        return fresh
+    }
+
+    /// Map normalized (0-1) touch coordinates to screen points, with menu bar
+    /// overshoot: when the touch is at the very top edge (y ≈ 0), the cursor is
+    /// allowed to move slightly above the display bounds so macOS triggers the
+    /// auto-hidden menu bar in fullscreen apps.
+    private func mapToDisplayPoint(x: Float, y: Float, bounds: CGRect) -> CGPoint {
+        var screenY = bounds.origin.y + CGFloat(y) * bounds.height
+        // Allow cursor to overshoot above the display for menu bar access
+        if y < 0.01 {
+            screenY = bounds.origin.y - menuBarOvershootPx * (1.0 - CGFloat(y) / 0.01)
+        }
+        return CGPoint(
+            x: bounds.origin.x + CGFloat(x) * bounds.width,
+            y: screenY
+        )
     }
 
     // MARK: - Event Injection
